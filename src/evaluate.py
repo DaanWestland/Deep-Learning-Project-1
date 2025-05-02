@@ -302,7 +302,7 @@ def parse_args() -> EvalConfig:
     p.add_argument('--scaler', type=Path, default=None, help='Scaler joblib file')
     p.add_argument('--hist-data', type=Path, default='data/Xtrain.mat', help='Historical data file')
     p.add_argument('--test-data', type=Path, default=None, help='Test data file')
-    p.add_argument('--n-steps', type=int, default=100, help='Forecast horizon')
+    p.add_argument('--n-steps', type=int, default=200, help='Forecast horizon')
     p.add_argument('--results-dir', type=Path, default=Path('eval_results'), help='Output directory')
     p.add_argument('--log-level', type=int, default=logging.INFO, help='Logging level')
     args = p.parse_args()
