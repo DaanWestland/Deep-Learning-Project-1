@@ -1,15 +1,17 @@
 """
-This module implements the training pipeline for the GRU forecasting model.
-It includes functionality for hyperparameter optimization using Optuna,
-cross-validation, and final model training with early stopping.
+This module implements the training pipeline for GRU-based forecasting models.
+It supports both single-step/multi-step (MIMO) and Seq2Seq GRU architectures.
+Hyperparameter optimization is done via Optuna, with k-fold CV.
+Final model is trained on full data using the best hyperparameters,
+with early stopping, checkpointing, and progress logging.
 """
 
 import os
 import json
 import logging
 from pathlib import Path
-from dataclasses import dataclass, asdict
-from typing import Tuple, Dict
+from dataclasses import dataclass
+from typing import Dict, Tuple
 
 import joblib
 import numpy as np
@@ -20,234 +22,92 @@ from sklearn.model_selection import KFold
 import optuna
 
 from data_loader import load_series, scale_series, TimeSeriesDataset
-from models import GRUForecast
+from models import GRUForecast, GRUSeq2Seq
 
 # -------- Configuration --------
-
 @dataclass
 class Config:
-    """
-    Configuration class for model training.
-    
-    This dataclass holds all the necessary parameters for the training pipeline:
-    - Data paths and output directories
-    - Cross-validation settings
-    - Training parameters
-    - Early stopping criteria
-    """
-    data_path: str = 'data/Xtrain.mat'  # Path to training data
-    output_dir: str = 'models'  # Directory to save models and results
-    base_name: str = 'gru_tuned'  # Base name for saved files
-    cv_trials: int = 50  # Number of hyperparameter optimization trials
-    cv_folds: int = 5  # Number of cross-validation folds
-    cv_epochs: int = 50  # Maximum epochs per CV fold
-    cv_patience: int = 5  # Early stopping patience for CV
-    final_epochs: int = 150  # Maximum epochs for final training
-    final_patience: int = 15  # Early stopping patience for final training
-    val_split: float = 0.2  # Validation set size ratio
+    data_path: str = 'data/Xtrain.mat'
+    output_dir: str = 'models'
+    base_name: str = 'gru_tuned'
+    cv_trials: int = 50
+    cv_folds: int = 5
+    cv_epochs: int = 50
+    cv_patience: int = 5
+    final_epochs: int = 150
+    final_patience: int = 15
+    val_split: float = 0.2
 
 # -------- Logger & Device --------
-
-def setup_logger(level: int = logging.INFO) -> logging.Logger:
-    """
-    Configure and return a logger with the specified level.
-    
-    Args:
-        level: Logging level (default: logging.INFO)
-        
-    Returns:
-        logging.Logger: Configured logger instance
-    """
-    logging.basicConfig(level=level, format='[%(levelname)s] %(message)s')
-    return logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+logger = logging.getLogger(__name__)
 
 def get_device() -> torch.device:
     """
-    Get the appropriate device (CPU or GPU) for training.
-    
-    Returns:
-        torch.device: CUDA device if available, else CPU
+    Return available device: prints running device (CPU vs CUDA),
+    and GPU details if available.
     """
-    return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-logger = setup_logger()
-
-# -------- Checkpoint & Artifact Utilities --------
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Running on device: {device}")
+    if device.type == 'cuda':
+        print(f"CUDA available: {torch.cuda.is_available()}, GPU count: {torch.cuda.device_count()}, GPU name: {torch.cuda.get_device_name(0)}")
+    else:
+        print("Using CPU")
+    return device
 
 def ensure_dir(path: Path):
-    """
-    Create a directory if it doesn't exist.
-    
-    Args:
-        path: Directory path to create
-    """
     if not path.exists():
         path.mkdir(parents=True, exist_ok=True)
 
-
-def load_model_if_exists(
-    ckpt_path: Path,
-    hyperparams: Dict,
-    device: torch.device
-) -> torch.nn.Module:
-    """
-    Load a model from checkpoint if it exists and matches the hyperparameters.
-    
-    Args:
-        ckpt_path: Path to the checkpoint file
-        hyperparams: Dictionary of model hyperparameters
-        device: Device to load the model onto
-        
-    Returns:
-        torch.nn.Module: Loaded model or None if checkpoint doesn't exist/mismatch
-    """
-    if not ckpt_path.exists():
-        return None
-    checkpoint = torch.load(ckpt_path, map_location=device)
-    if checkpoint.get('hyperparams') != hyperparams:
-        return None
-    model = GRUForecast(
-        hidden_size=hyperparams['hidden_size'],
-        num_layers=hyperparams['num_layers'],
-        dropout=hyperparams.get('dropout', 0.0)
-    ).to(device)
-    model.load_state_dict(checkpoint['model_state'])
-    logger.info(f"Loaded existing model from {ckpt_path}")
-    return model
-
-
-def save_checkpoint(
-    ckpt_path: Path,
-    model: nn.Module,
-    hyperparams: Dict,
-    val_loss: float
-):
-    """
-    Save a model checkpoint with its hyperparameters and validation loss.
-    
-    Args:
-        ckpt_path: Path to save the checkpoint
-        model: Model to save
-        hyperparams: Dictionary of model hyperparameters
-        val_loss: Validation loss achieved by the model
-    """
-    torch.save({
-        'model_state': model.state_dict(),
-        'hyperparams': hyperparams,
-        'val_loss': val_loss
-    }, ckpt_path)
-    logger.info(f"Saved checkpoint to {ckpt_path}")
-
-# -------- Training & Evaluation --------
-
-def train_epoch(
-    model: nn.Module,
-    loader: DataLoader,
-    criterion: nn.Module,
-    optimizer: optim.Optimizer,
-    device: torch.device
-) -> float:
-    """
-    Train the model for one epoch.
-    
-    Args:
-        model: Model to train
-        loader: DataLoader providing training batches
-        criterion: Loss function
-        optimizer: Optimizer for updating model parameters
-        device: Device to run training on
-        
-    Returns:
-        float: Average training loss for the epoch
-    """
-    model.train()
-    total_loss = 0.0
-    for X, y in loader:
-        X, y = X.to(device), y.to(device)
-        optimizer.zero_grad()
-        loss = criterion(model(X), y)
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item()
-    return total_loss / len(loader)
-
-
-def evaluate(
-    model: nn.Module,
-    loader: DataLoader,
-    criterion: nn.Module,
-    device: torch.device
-) -> float:
-    """
-    Evaluate the model on a dataset.
-    
-    Args:
-        model: Model to evaluate
-        loader: DataLoader providing evaluation batches
-        criterion: Loss function
-        device: Device to run evaluation on
-        
-    Returns:
-        float: Average evaluation loss
-    """
-    model.eval()
-    losses = []
-    with torch.no_grad():
-        for X, y in loader:
-            X, y = X.to(device), y.to(device)
-            losses.append(criterion(model(X), y).item())
-    return float(np.mean(losses))
-
-# -------- Hyperparameter Optimization --------
-
-def objective(
-    trial: optuna.trial.Trial,
-    data: np.ndarray,
-    config: Config
-) -> float:
-    """
-    Objective function for hyperparameter optimization.
-    
-    This function:
-    1. Suggests hyperparameters using Optuna
-    2. Performs k-fold cross-validation
-    3. Trains and evaluates the model for each fold
-    4. Returns the mean validation loss across folds
-    
-    Args:
-        trial: Optuna trial object
-        data: Training data
-        config: Training configuration
-        
-    Returns:
-        float: Mean validation loss across folds
-    """
+# -------- Objective for Optuna --------
+def objective(trial: optuna.trial.Trial, data: np.ndarray, config: Config) -> float:
     # Suggest hyperparameters
     params = {
+        'model_type': trial.suggest_categorical('model_type', ['GRUForecast', 'GRUSeq2Seq']),
         'lookback': trial.suggest_int('lookback', 100, 200, step=10),
-        'batch_size': trial.suggest_categorical('batch_size', [4,8,16,32,64,128]),
-        'lr': trial.suggest_float('lr', 1e-5, 1e-2, log=True),
-        'hidden_size': trial.suggest_int('hidden_size', 32, 256, step=32),
-        'num_layers': trial.suggest_int('num_layers', 1, 6),
-        'dropout': trial.suggest_float('dropout', 0.2, 0.6, step=0.1),
-        'optimizer': trial.suggest_categorical('optimizer', ['Adam', 'AdamW'])
+        'horizon': trial.suggest_int('horizon', 1, 30, step=5),
+        'batch_size': trial.suggest_categorical('batch_size', [4, 8, 16, 32, 48, 64]),
+        'lr': trial.suggest_float('lr', 1e-4, 1e-2, log=True),
+        'hidden_size': trial.suggest_int('hidden_size', 16, 228, step=16),
+        'num_layers': trial.suggest_int('num_layers', 1, 8, step=1),
+        'dropout': trial.suggest_float('dropout', 0.0, 0.5, step=0.1),
+        'optimizer': trial.suggest_categorical('optimizer', ['Adam', 'AdamW']),
+        'tf_prob': trial.suggest_float('tf_prob', 0.0, 1.0)
     }
+    logger.info(f"Trial {trial.number}: params={params}")
     device = get_device()
-    ds = TimeSeriesDataset(data, params['lookback'])
+
+    # Prepare dataset and cross-validation
+    ds = TimeSeriesDataset(data, params['lookback'], params['horizon'])
     kf = KFold(n_splits=config.cv_folds, shuffle=True, random_state=42)
+    fold_losses = []
+    global_step = 0
 
-    fold_vals = []
-    for fold, (train_idx, val_idx) in enumerate(kf.split(ds), start=1):
+    # Cross-validation loop
+    for fold, (train_idx, val_idx) in enumerate(kf.split(range(len(ds))), start=1):
+        logger.info(f" Trial {trial.number} - Fold {fold}/{config.cv_folds}")
         train_ds = Subset(ds, train_idx)
-        val_ds = Subset(ds, val_idx)
+        val_ds   = Subset(ds, val_idx)
         train_loader = DataLoader(train_ds, batch_size=params['batch_size'], shuffle=True, drop_last=True)
-        val_loader = DataLoader(val_ds, batch_size=params['batch_size'])
+        val_loader   = DataLoader(val_ds,   batch_size=params['batch_size'])
 
-        model = GRUForecast(
-            hidden_size=params['hidden_size'],
-            num_layers=params['num_layers'],
-            dropout=params['dropout']
-        ).to(device)
+        # Instantiate model for this fold
+        if params['model_type'] == 'GRUForecast':
+            model = GRUForecast(
+                input_size=1,
+                hidden_size=params['hidden_size'],
+                num_layers=params['num_layers'],
+                dropout=params['dropout'],
+                horizon=params['horizon']
+            ).to(device)
+        else:
+            model = GRUSeq2Seq(
+                input_size=1,
+                hidden_size=params['hidden_size'],
+                num_layers=params['num_layers'],
+                dropout=params['dropout'],
+                horizon=params['horizon']
+            ).to(device)
 
         criterion = nn.MSELoss()
         optimizer = getattr(optim, params['optimizer'])(model.parameters(), lr=params['lr'])
@@ -257,213 +117,240 @@ def objective(
             factor=0.5
         )
 
-        best_val, no_improve = float('inf'), 0
+        best_fold = float('inf')
+        no_improve = 0
+        # Epoch loop
         for epoch in range(1, config.cv_epochs + 1):
-            train_epoch(model, train_loader, criterion, optimizer, device)
-            val_loss = evaluate(model, val_loader, criterion, device)
-            scheduler.step(val_loss)
+            # Training
+            model.train()
+            train_loss = 0.0
+            for X, y in train_loader:
+                X, y = X.to(device), y.to(device)
+                optimizer.zero_grad()
+                if params['model_type'] == 'GRUSeq2Seq':
+                    pred = model(X, target=y, teacher_forcing_prob=params['tf_prob'])
+                else:
+                    pred = model(X)
+                loss = criterion(pred, y)
+                loss.backward()
+                optimizer.step()
+                train_loss += loss.item()
+            train_loss /= len(train_loader)
 
-            if val_loss < best_val:
-                best_val, no_improve = val_loss, 0
+            # Validation
+            model.eval()
+            val_loss = 0.0
+            with torch.no_grad():
+                for X, y in val_loader:
+                    X, y = X.to(device), y.to(device)
+                    if params['model_type'] == 'GRUSeq2Seq':
+                        pred = model(X, target=None, teacher_forcing_prob=0.0)
+                    else:
+                        pred = model(X)
+                    val_loss += criterion(pred, y).item()
+            val_loss /= len(val_loader)
+
+            # Report to Optuna for pruning
+            global_step += 1
+            trial.report(val_loss, global_step)
+            logger.info(f"  Epoch {epoch}/{config.cv_epochs} - train_loss: {train_loss:.6f}, val_loss: {val_loss:.6f}")
+            scheduler.step(val_loss)
+            if trial.should_prune():
+                logger.info(f"Trial {trial.number} pruned at fold {fold}, epoch {epoch}")
+                raise optuna.TrialPruned()
+
+            # Early stopping per fold
+            if val_loss < best_fold:
+                best_fold = val_loss
+                no_improve = 0
             else:
                 no_improve += 1
                 if no_improve >= config.cv_patience:
+                    logger.info(f"Early stopping fold {fold} at epoch {epoch}")
                     break
 
-        fold_vals.append(best_val)
-        trial.report(best_val, fold)
-        if trial.should_prune():
-            raise optuna.TrialPruned()
+        fold_losses.append(best_fold)
+    # Compute mean of fold best losses
+    mean_loss = float(np.mean(fold_losses))
+    logger.info(f"Trial {trial.number} complete. Mean CV loss: {mean_loss:.6f}")
+    return mean_loss
 
-    return float(np.mean(fold_vals))
-
-
-def optimize_hyperparameters(
-    data: np.ndarray,
-    config: Config
-) -> Tuple[Dict, optuna.Study]:
-    """
-    Run hyperparameter optimization using Optuna.
-    
-    This function:
-    1. Creates an Optuna study with TPE sampler and Hyperband pruner
-    2. Runs the optimization for the specified number of trials
-    3. Saves the study and best parameters
-    
-    Args:
-        data: Training data
-        config: Training configuration
-        
-    Returns:
-        Tuple[Dict, optuna.Study]:
-            - Best hyperparameters found
-            - Complete Optuna study object
-    """
+# -------- Hyperparameter Optimization --------
+def optimize_hyperparameters(data: np.ndarray, config: Config) -> Tuple[Dict, optuna.Study]:
+    ensure_dir(Path(config.output_dir))
     study = optuna.create_study(
         direction='minimize',
         sampler=optuna.samplers.TPESampler(seed=42),
-        pruner=optuna.pruners.HyperbandPruner()
+        pruner=optuna.pruners.MedianPruner()
     )
     study.optimize(lambda t: objective(t, data, config), n_trials=config.cv_trials)
 
-    # Save study and best parameters
     out_dir = Path(config.output_dir)
-    ensure_dir(out_dir)
+    # Save study
     study_path = out_dir / f"{config.base_name}_study.pkl"
     joblib.dump(study, study_path)
     logger.info(f"Optuna study saved to {study_path}")
-
+    # Save best params
     params_path = out_dir / f"{config.base_name}_best_params.json"
     with open(params_path, 'w') as fp:
         json.dump(study.best_trial.params, fp, indent=2)
     logger.info(f"Best params saved to {params_path}")
-
     return study.best_trial.params, study
 
 # -------- Final Training --------
-
-def train_final(
-    data: np.ndarray,
-    scaler,
-    best_params: dict,
-    config: Config
-) -> torch.nn.Module:
-    """
-    Train the final model using the best hyperparameters.
-    
-    This function:
-    1. Ensures output directory exists
-    2. Loads or saves the data scaler
-    3. Loads an existing model checkpoint if available
-    4. Creates train/validation splits
-    5. Trains the model with early stopping
-    6. Saves checkpoints and final model
-    """
-    # Select device and prepare output directory
+def train_final(data: np.ndarray, scaler, best_params: Dict, config: Config) -> torch.nn.Module:
     device = get_device()
     out_dir = Path(config.output_dir)
     ensure_dir(out_dir)
 
-    # Define paths for checkpoint and scaler
-    ckpt_path = out_dir / f"{config.base_name}_best.pth"
+    # Save or load scaler
     scaler_path = out_dir / f"{config.base_name}_scaler.joblib"
-
-    # -------------------------------------------------------------------------
-    # 1) Ensure scaler on disk: load existing or save new one
-    # -------------------------------------------------------------------------
     if scaler_path.exists():
         scaler = joblib.load(scaler_path)
-        logger.info(f"Loaded existing scaler from {scaler_path}")
+        logger.info(f"Loaded scaler from {scaler_path}")
     else:
         joblib.dump(scaler, scaler_path)
-        logger.info(f"Saved new scaler to {scaler_path}")
+        logger.info(f"Saved scaler to {scaler_path}")
 
-    # -------------------------------------------------------------------------
-    # 2) Load pretrained model if checkpoint matches hyperparameters
-    # -------------------------------------------------------------------------
-    model = load_model_if_exists(ckpt_path, best_params, device)
-    if model is not None:
-        logger.info("Using pretrained model, skipping final training.")
-        return model
+    # Define checkpoint path
+    ckpt_name = f"{config.base_name}_{best_params['model_type']}_h{best_params['horizon']}_best.pth"
+    ckpt_path = out_dir / ckpt_name
 
-    # -------------------------------------------------------------------------
-    # 3) Prepare dataset and data loaders
-    # -------------------------------------------------------------------------
-    ds = TimeSeriesDataset(data, best_params['lookback'])
+    # Load existing if matching
+    if ckpt_path.exists():
+        ckpt = torch.load(ckpt_path, map_location=device)
+        if ckpt.get('hyperparams') == best_params:
+            logger.info(f"Using existing model from {ckpt_path}")
+            model = GRUForecast(input_size=1,
+                                hidden_size=best_params['hidden_size'],
+                                num_layers=best_params['num_layers'],
+                                dropout=best_params['dropout'],
+                                horizon=best_params['horizon']) if best_params['model_type']=='GRUForecast' else GRUSeq2Seq(
+                                    input_size=1,
+                                    hidden_size=best_params['hidden_size'],
+                                    num_layers=best_params['num_layers'],
+                                    dropout=best_params['dropout'],
+                                    horizon=best_params['horizon']
+                                )
+            model.load_state_dict(ckpt['model_state'])
+            return model.to(device)
+
+    # Prepare dataset and loaders
+    ds = TimeSeriesDataset(data, best_params['lookback'], best_params['horizon'])
     val_size = int(len(ds) * config.val_split)
     train_ds, val_ds = random_split(
         ds,
         [len(ds) - val_size, val_size],
         generator=torch.Generator().manual_seed(42)
     )
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=best_params['batch_size'],
-        shuffle=True,
-        drop_last=True
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=best_params['batch_size']
-    )
+    train_loader = DataLoader(train_ds, batch_size=best_params['batch_size'], shuffle=True, drop_last=True)
+    val_loader   = DataLoader(val_ds,   batch_size=best_params['batch_size'])
 
-    # -------------------------------------------------------------------------
-    # 4) Initialize model, loss, optimizer, and learning rate scheduler
-    # -------------------------------------------------------------------------
-    model = GRUForecast(
-        hidden_size=best_params['hidden_size'],
-        num_layers=best_params['num_layers'],
-        dropout=best_params.get('dropout', 0.0)
-    ).to(device)
+    # Instantiate model
+    if best_params['model_type'] == 'GRUForecast':
+        model = GRUForecast(
+            input_size=1,
+            hidden_size=best_params['hidden_size'],
+            num_layers=best_params['num_layers'],
+            dropout=best_params['dropout'],
+            horizon=best_params['horizon']
+        ).to(device)
+    else:
+        model = GRUSeq2Seq(
+            input_size=1,
+            hidden_size=best_params['hidden_size'],
+            num_layers=best_params['num_layers'],
+            dropout=best_params['dropout'],
+            horizon=best_params['horizon']
+        ).to(device)
+
     criterion = nn.MSELoss()
-    optimizer = getattr(optim, best_params['optimizer'])(
-        model.parameters(), lr=best_params['lr']
-    )
+    optimizer = getattr(optim, best_params['optimizer'])(model.parameters(), lr=best_params['lr'])
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
-        patience=max(1, config.final_patience // 2),
+        patience=max(1, config.final_patience//2),
         factor=0.5
     )
 
-    # -------------------------------------------------------------------------
-    # 5) Training loop with early stopping
-    # -------------------------------------------------------------------------
+    # Final training loop
+    logger.info("Starting final training...")
     best_val = float('inf')
     no_improve = 0
     for epoch in range(1, config.final_epochs + 1):
-        # Train for one epoch
-        train_loss = train_epoch(
-            model, train_loader, criterion, optimizer, device
-        )
-        # Evaluate on validation set
-        val_loss = evaluate(
-            model, val_loader, criterion, device
-        )
-        # Adjust learning rate on plateau
+        # Train
+        model.train()
+        train_loss = 0.0
+        for X, y in train_loader:
+            X, y = X.to(device), y.to(device)
+            optimizer.zero_grad()
+            if best_params['model_type'] == 'GRUSeq2Seq':
+                pred = model(X, target=y, teacher_forcing_prob=best_params['tf_prob'])
+            else:
+                pred = model(X)
+            loss = criterion(pred, y)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+        train_loss /= len(train_loader)
+
+        # Validate
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for X, y in val_loader:
+                X, y = X.to(device), y.to(device)
+                if best_params['model_type'] == 'GRUSeq2Seq':
+                    pred = model(X, target=None, teacher_forcing_prob=0.0)
+                else:
+                    pred = model(X)
+                val_loss += criterion(pred, y).item()
+        val_loss /= len(val_loader)
+
         scheduler.step(val_loss)
+        logger.info(f"Epoch {epoch}/{config.final_epochs} - train_loss: {train_loss:.6f}, val_loss: {val_loss:.6f}")
 
-        logger.info(
-            f"Epoch {epoch}: train_loss={train_loss:.4f}, val_loss={val_loss:.4f}"
-        )
-
-        # Check for improvement and save checkpoint
+        # Checkpointing
         if val_loss < best_val:
             best_val = val_loss
             no_improve = 0
-            save_checkpoint(ckpt_path, model, best_params, val_loss)
+            torch.save({
+                'model_state': model.state_dict(),
+                'hyperparams': best_params,
+                'val_loss': val_loss
+            }, ckpt_path)
+            logger.info(f"Saved checkpoint to {ckpt_path}")
         else:
             no_improve += 1
             if no_improve >= config.final_patience:
-                logger.info(
-                    f"Early stopping triggered after {epoch} epochs (patience={config.final_patience})."
-                )
+                logger.info(f"Early stopping at epoch {epoch} (patience={config.final_patience})")
                 break
 
-    # Return the trained model
+    logger.info("Final training complete.")
     return model
 
-# -------- Main Entry Point Point --------
-
+# -------- Main --------
 def main():
     config = Config()
-    logger.info("Loading and preprocessing data...")
+    logger.info("Loading data...")
     series = load_series(config.data_path)
     norm, scaler = scale_series(series)
 
-    study_path = Path(config.output_dir) / f"{config.base_name}_study.pkl"
-    params_path = Path(config.output_dir) / f"{config.base_name}_best_params.json"
-    if study_path.exists() and params_path.exists():
-        logger.info("Loading existing study and best parameters...")
-        study = joblib.load(study_path)
-        with open(params_path, 'r') as fp:
-            best_params = json.load(fp)
+    # Optuna study and parameters
+    out_dir = Path(config.output_dir)
+    study_file = out_dir / f"{config.base_name}_study.pkl"
+    params_file = out_dir / f"{config.base_name}_best_params.json"
+    if study_file.exists() and params_file.exists():
+        logger.info("Loading existing study and parameters...")
+        study = joblib.load(study_file)
+        best_params = json.loads(params_file.read_text())
     else:
         logger.info("Starting hyperparameter optimization...")
         best_params, study = optimize_hyperparameters(norm, config)
 
-    logger.info("Training final model...")
+    logger.info(f"Best hyperparameters: {best_params}")
+    logger.info("Commencing final model training...")
     model = train_final(norm, scaler, best_params, config)
-    logger.info("Training complete!")
+    logger.info("All done!")
 
 if __name__ == '__main__':
     main()
