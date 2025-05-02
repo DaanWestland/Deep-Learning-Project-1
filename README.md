@@ -13,6 +13,15 @@ This project implements a deep learning-based time series forecasting system usi
 │   ├── train.py       # Training pipeline and hyperparameter optimization
 │   ├── evaluate.py    # Model evaluation and metrics
 │   └── baselines.py   # Baseline models for comparison
+├── models/            # Directory for trained models and related files
+│   ├── gru_tuned_best.pth        # Best performing model checkpoint
+│   ├── gru_tuned_scaler.joblib   # Data scaler used for preprocessing
+│   ├── gru_tuned_best_params.json # Best hyperparameters
+│   └── gru_tuned_study.pkl       # Optuna study results
+├── eval_results/      # Directory for evaluation outputs
+│   ├── forecast.png   # Visualization of model predictions
+│   └── gru_tuned_best_ts.pt     # TorchScript version of the model
+├── baseline_results/  # Directory for baseline model results
 └── README.md          # This file
 ```
 
@@ -44,6 +53,24 @@ This project implements a deep learning-based time series forecasting system usi
    ```bash
    python src/train.py
    ```
+4. Evaluate the trained model:
+   ```bash
+   python src/evaluate.py --checkpoint models/gru_tuned_best.pth
+   ```
+
+## Model Files
+
+The trained model and related files are stored in the `models/` directory:
+- `gru_tuned_best.pth`: The best performing model checkpoint
+- `gru_tuned_scaler.joblib`: The data scaler used for preprocessing
+- `gru_tuned_best_params.json`: The optimal hyperparameters found during training
+- `gru_tuned_study.pkl`: The complete Optuna study results
+
+## Evaluation Results
+
+The evaluation process generates several outputs stored in the `eval_results/` directory:
+- `forecast.png`: A visualization comparing the model's predictions with actual values
+- `gru_tuned_best_ts.pt`: A TorchScript version of the model for production deployment
 
 ## Model Architecture
 
