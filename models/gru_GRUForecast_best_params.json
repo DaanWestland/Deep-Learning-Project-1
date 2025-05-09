@@ -1,0 +1,20 @@
+{
+  "batch_size": 8,
+  "dropout": 0.05,
+  "enforce_stat": false,
+  "hidden_size": 80,
+  "horizon": 10,
+  "lookback": 120,
+  "lr": 0.0018129811963733034,
+  "model_type": "GRUForecast",
+  "num_lags": 10,
+  "num_layers": 4,
+  "num_roll_windows_choices": 2,
+  "optimizer": "AdamW",
+  "plateau_factor": 0.25,
+  "plateau_patience": 5,
+  "scale_method": "minmax",
+  "scheduler": "ReduceLROnPlateau",
+  "use_feature_engineer": true,
+  "weight_decay": 2.6585766646839762e-05
+}

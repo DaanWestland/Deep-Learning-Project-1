@@ -1,0 +1,22 @@
+{
+  "batch_size": 8,
+  "dropout": 0.05,
+  "enforce_stat": false,
+  "hidden_size": 48,
+  "horizon": 10,
+  "lookback": 120,
+  "lr": 0.004660739405060072,
+  "model_type": "GRUSeq2Seq",
+  "num_lags": 4,
+  "num_layers": 1,
+  "num_roll_windows_choices": 0,
+  "onecycle_div_factor": 12.58010520593719,
+  "onecycle_max_lr": 0.006942568964043635,
+  "optimizer": "AdamW",
+  "pct_start": 0.2,
+  "scale_method": "minmax",
+  "scheduler": "OneCycleLR",
+  "tf_init": 0.30000000000000004,
+  "use_feature_engineer": true,
+  "weight_decay": 7.268507603605811e-06
+}

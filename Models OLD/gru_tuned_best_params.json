@@ -1,9 +1,0 @@
-{
-  "lookback": 100,
-  "batch_size": 4,
-  "lr": 0.003934830163116971,
-  "hidden_size": 160,
-  "num_layers": 3,
-  "dropout": 0.2,
-  "optimizer": "AdamW"
-}
